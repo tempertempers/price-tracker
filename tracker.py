@@ -5,9 +5,9 @@ import requests
 from playwright.sync_api import sync_playwright
 
 # --- CONFIGURATION ---
-# This pulls the URL from the 'Variable' you will create in the Unraid Template
+# Pulls from Unraid 'Variable' named DISCORD_WEBHOOK
 DISCORD_WEBHOOK_URL = os.getenv("DISCORD_WEBHOOK")
-CHECK_INTERVAL = 300  # 5 minutes
+CHECK_INTERVAL = 300 
 DB_FILE = "/app/tracker_db.json"
 
 STORES = {
@@ -31,57 +31,32 @@ STORES = {
     }
 }
 
-def notify_discord(store_name, title, price, url):
+def send_to_discord(payload):
+    """Internal helper to send any payload to Discord"""
     if not DISCORD_WEBHOOK_URL:
-        print("CRITICAL ERROR: DISCORD_WEBHOOK environment variable is not set in Unraid!")
-        return
+        print("CRITICAL: No DISCORD_WEBHOOK found in environment variables!")
+        return False
+    try:
+        response = requests.post(DISCORD_WEBHOOK_URL, json=payload, timeout=10)
+        response.raise_for_status()
+        return True
+    except Exception as e:
+        print(f"Discord Error: {e}")
+        return False
 
+def startup_test():
+    """Sends a one-time message when the script starts to verify connectivity"""
+    print("Sending startup test to Discord...")
     payload = {
         "embeds": [{
-            "title": f"🚀 5090 Found at {store_name}!",
-            "description": f"**Item:** {title}\n**Price:** {price}",
-            "url": url,
-            "color": 5814783,
-            "footer": {"text": "Unraid GPU Tracker Service"}
+            "title": "✅ GPU Tracker Online",
+            "description": "The service has started successfully on Unraid and is now monitoring for RTX 5090 listings.",
+            "color": 3066993 # Green
         }]
     }
-    try:
-        response = requests.post(DISCORD_WEBHOOK_URL, json=payload)
-        response.raise_for_status()
-    except Exception as e:
-        print(f"Failed to send Discord notification: {e}")
+    if send_to_discord(payload):
+        print("Startup test sent successfully!")
+    else:
+        print("Startup test failed. Check your Webhook URL in Unraid settings.")
 
-def run_tracker():
-    history = {}
-    if os.path.exists(DB_FILE):
-        try:
-            with open(DB_FILE, 'r') as f:
-                history = json.load(f)
-        except:
-            history = {}
-
-    with sync_playwright() as p:
-        # Launching browser with a standard user agent to avoid bot detection
-        browser = p.chromium.launch(headless=True)
-        context = browser.new_context(
-            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36"
-        )
-        page = context.new_page()
-
-        for store, info in STORES.items():
-            try:
-                print(f"Checking {store}...")
-                page.goto(info['url'], wait_until="domcontentloaded", timeout=60000)
-                # Give the page 3 seconds to execute scripts/load prices
-                page.wait_for_timeout(3000) 
-                
-                cards = page.query_selector_all(info['card_selector'])
-                for card in cards:
-                    title_el = card.query_selector(info['title_selector'])
-                    price_el = card.query_selector(info['price_selector'])
-                    
-                    if title_el and price_el:
-                        title = title_el.inner_text().strip()
-                        price = price_el.inner_text().strip()
-                        
-                        # Verify it's actually a 509
+def notify_match(store_name, title, price
