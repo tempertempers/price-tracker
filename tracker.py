@@ -59,4 +59,65 @@ def startup_test():
     else:
         print("Startup test failed. Check your Webhook URL in Unraid settings.")
 
-def notify_match(store_name, title, price
+def notify_match(store_name, title, price, url):
+    """Sends an alert when a 5090 is found"""
+    payload = {
+        "embeds": [{
+            "title": f"🚨 5090 ALERT at {store_name}!",
+            "description": f"**Product:** {title}\n**Price:** {price}",
+            "url": url,
+            "color": 15158332 # Red
+        }]
+    }
+    send_to_discord(payload)
+
+def run_tracker():
+    history = {}
+    if os.path.exists(DB_FILE):
+        try:
+            with open(DB_FILE, 'r') as f:
+                history = json.load(f)
+        except: history = {}
+
+    with sync_playwright() as p:
+        browser = p.chromium.launch(headless=True)
+        context = browser.new_context(user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36")
+        page = context.new_page()
+
+        for store, info in STORES.items():
+            try:
+                print(f"Checking {store}...")
+                page.goto(info['url'], wait_until="domcontentloaded", timeout=60000)
+                page.wait_for_timeout(3000) 
+                
+                cards = page.query_selector_all(info['card_selector'])
+                for card in cards:
+                    title_el = card.query_selector(info['title_selector'])
+                    price_el = card.query_selector(info['price_selector'])
+                    
+                    if title_el and price_el:
+                        title = title_el.inner_text().strip()
+                        price = price_el.inner_text().strip()
+                        
+                        if "5090" in title:
+                            item_id = f"{store}-{title}-{price}"
+                            if item_id not in history:
+                                notify_match(store, title, price, info['url'])
+                                history[item_id] = time.time()
+            except Exception as e:
+                print(f"Error checking {store}: {e}")
+
+        browser.close()
+
+    with open(DB_FILE, 'w') as f:
+        json.dump(history, f)
+
+if __name__ == "__main__":
+    # 1. Run the test first
+    startup_test()
+    
+    # 2. Enter the loop
+    while True:
+        run_tracker()
+        print(f"Sleeping for {CHECK_INTERVAL}s...")
+        time.sleep(CHECK_INTERVAL)
