@@ -119,8 +119,6 @@ def run_tracker():
         json.dump(history, f)
 
 if __name__ == "__main__":
-    print("GPU Tracker service online. Initializing...")
-    
     while True:
         run_tracker()
         print(f"Done. Sleeping {CHECK_INTERVAL}s.\n")
