@@ -120,7 +120,6 @@ def run_tracker():
 
 if __name__ == "__main__":
     print("GPU Tracker service online. Initializing...")
-    startup_test() 
     
     while True:
         run_tracker()
