@@ -2,7 +2,7 @@ import os
 import time
 import json
 import requests
-from playwright.sync_api import sync_playwright
+from playwright.sync_api import sync_playwright, TimeoutError
 
 # --- CONFIGURATION ---
 DISCORD_WEBHOOK_URL = os.getenv("DISCORD_WEBHOOK")
@@ -13,30 +13,39 @@ DEBUG_DIR = "/app/data/debug"
 STORES = {
     "inet_fynd": {
         "url": "https://www.inet.se/fyndhornan?search=5090",
-        "card_selector": "article, .product-item, [class*='productCard']", 
-        "title_selector": "h3, .title, [class*='name']",
-        "price_selector": "span.price, .price, [class*='price']"
+        "card_selector": "article", 
+        "title_selector": "h3",
+        "price_selector": "span.price",
+        "cookie_button": "button:has-text('Acceptera'), button:has-text('Godkänn')"
     },
     "elgiganten": {
         "url": "https://www.elgiganten.se/search?q=5090",
-        "card_selector": "article.product-tile, .product-container", 
-        "title_selector": ".product-name, h2",
-        "price_selector": ".price-value, .current-price"
+        "card_selector": "article.product-tile", 
+        "title_selector": ".product-name",
+        "price_selector": ".price-value",
+        "cookie_button": "#coo-accept-all, button:has-text('Acceptera alla')"
     },
     "netonnet": {
         "url": "https://www.netonnet.se/search?query=5090",
-        "card_selector": ".productItem, .product-card",
-        "title_selector": ".title, .product-title",
-        "price_selector": ".price, .product-price"
+        "card_selector": ".productItem",
+        "title_selector": ".title",
+        "price_selector": ".price",
+        "cookie_button": "button:has-text('Jag förstår'), button:has-text('Acceptera')"
     }
 }
 
-def send_to_discord(payload):
-    if not DISCORD_WEBHOOK_URL: return False
+def handle_cookies(page, store_name, selector):
+    """Attempt to click the cookie accept button if it exists"""
     try:
-        requests.post(DISCORD_WEBHOOK_URL, json=payload, timeout=10).raise_for_status()
-        return True
-    except: return False
+        # Wait up to 5 seconds for the cookie banner to appear
+        button = page.wait_for_selector(selector, timeout=5000)
+        if button:
+            print(f"  [Cookie] Clicking accept for {store_name}...")
+            button.click()
+            page.wait_for_timeout(1000) # Wait for animation
+    except TimeoutError:
+        # If no button found, maybe it's already gone or didn't show
+        pass
 
 def run_tracker():
     os.makedirs(DEBUG_DIR, exist_ok=True)
@@ -48,24 +57,24 @@ def run_tracker():
 
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=True)
-        # Use a real browser user agent to avoid bot detection
         context = browser.new_context(user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
         page = context.new_page()
 
         for store, info in STORES.items():
             try:
                 print(f"Checking {store}...")
-                page.goto(info['url'], wait_until="networkidle", timeout=60000)
-                page.wait_for_timeout(5000) # Wait 5s for dynamic content
+                page.goto(info['url'], wait_until="domcontentloaded", timeout=60000)
+                
+                # Handle those pesky cookies
+                handle_cookies(page, store, info['cookie_button'])
+                
+                page.wait_for_timeout(3000) 
                 
                 cards = page.query_selector_all(info['card_selector'])
-                print(f"  [Log] Scanned {len(cards)} potential items.")
+                print(f"  [Log] Scanned {len(cards)} items.")
 
-                # If no items found, take a screenshot to debug
                 if len(cards) == 0:
-                    screenshot_path = f"{DEBUG_DIR}/{store}_error.png"
-                    page.screenshot(path=screenshot_path)
-                    print(f"  [!] Found 0 items. Saved screenshot to: {screenshot_path}")
+                    page.screenshot(path=f"{DEBUG_DIR}/{store}_error.png")
                 
                 for card in cards:
                     title_el = card.query_selector(info['title_selector'])
@@ -75,22 +84,19 @@ def run_tracker():
                         title = title_el.inner_text().strip()
                         price = price_el.inner_text().strip()
                         
+                        # LOGGING: See everything found to ensure we are reading correctly
+                        print(f"    - Found: {title[:30]}... | {price}")
+                        
                         if "5090" in title:
                             item_id = f"{store}-{title}-{price}"
                             if item_id not in history:
-                                print(f"    -> MATCH FOUND: {title} ({price})")
-                                notify_payload = {
-                                    "embeds": [{
-                                        "title": f"🚨 5090 ALERT: {store}",
-                                        "description": f"**{title}**\nPrice: {price}",
-                                        "url": info['url'],
-                                        "color": 15158332
-                                    }]
-                                }
-                                send_to_discord(notify_payload)
+                                print(f"    !!! 5090 MATCH: {title}")
+                                payload = {"embeds": [{"title": f"🚨 5090 ALERT", "description": f"{title}\n{price}", "url": info['url'], "color": 15158332}]}
+                                requests.post(DISCORD_WEBHOOK_URL, json=payload)
                                 history[item_id] = time.time()
+                                
             except Exception as e:
-                print(f"  [Error] {store}: {str(e)[:100]}")
+                print(f"  [Error] {store}: {str(e)[:50]}")
 
         browser.close()
 
@@ -98,8 +104,8 @@ def run_tracker():
         json.dump(history, f)
 
 if __name__ == "__main__":
-    print("GPU Tracker service online. Initializing...")
+    print("Tracker starting...")
     while True:
         run_tracker()
-        print(f"Sleeping for {CHECK_INTERVAL}s...\n")
+        print(f"Done. Waiting {CHECK_INTERVAL}s.\n")
         time.sleep(CHECK_INTERVAL)
