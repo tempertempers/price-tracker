@@ -18,10 +18,14 @@ STORES = {
             "&filter=%7B%22query%22%3A%22RTX%205090%22%2C%22templateId%22%3A17%7D"
             "&sortColumn=search&sortDirection=desc"
         ),
+        # Stable semantic test-id — won't break on CSS deploys
         "wait_selector": 'li[data-test-id^="search_product"]',
         "card_selector": 'li[data-test-id^="search_product"]',
         "title_selector": "h3",
+        # Shelf price is in div.pvyf6gm > span[data-test-is-discounted-price]
+        # (first price span per card is a 799kr game voucher — pvyf6gm targets only the real price)
         "price_selector": '[class*="pvyf6gm"] span[data-test-is-discounted-price]',
+        "price_attr": None,   # use inner text
         "load_event": "domcontentloaded",
         "display_name": "inet.se",
         "store_url": "https://www.inet.se",
@@ -31,10 +35,15 @@ STORES = {
             "https://www.elgiganten.se/gaming/datorkomponenter/grafikkort-gpu"
             "?f=30877%3AGeForce%2520RTX%25205090"
         ),
-        "wait_selector": "[class*='product-tile'], [class*='ProductTile'], [data-testid*='product']",
-        "card_selector": "[class*='product-tile'], [class*='ProductTile'], [data-testid*='product']",
-        "title_selector": "h3, h2, [class*='title'], [class*='name']",
-        "price_selector": "[class*='price'], [class*='Price']",
+        # Stable semantic attribute on each product li
+        "wait_selector": 'li[data-cro="product-item"]',
+        "card_selector": 'li[data-cro="product-item"]',
+        # h2 is the product title inside each card
+        "title_selector": "h2",
+        # Price lives in data-primary-price attribute on a div — raw integer e.g. "35990"
+        # Elgiganten uses Tailwind utility classes so [class*='price'] matches nothing
+        "price_selector": "[data-primary-price]",
+        "price_attr": "data-primary-price",   # read attribute, not inner text
         "load_event": "domcontentloaded",
         "display_name": "Elgiganten",
         "store_url": "https://www.elgiganten.se",
@@ -43,11 +52,10 @@ STORES = {
 
 WAIT_FOR_CONTENT_TIMEOUT = 20_000
 
-# Discord color codes (decimal)
-COLOR_GREEN  = 0x2ECC71   # no changes
-COLOR_RED    = 0xE74C3C   # new listing or price drop
-COLOR_ORANGE = 0xE67E22   # price increase or listing gone
-COLOR_GREY   = 0x95A5A6   # error / no data
+COLOR_GREEN  = 0x2ECC71
+COLOR_RED    = 0xE74C3C
+COLOR_ORANGE = 0xE67E22
+COLOR_GREY   = 0x95A5A6
 
 
 # ---------------------------------------------------------------------------
@@ -84,20 +92,39 @@ def handle_cookie_popup(page):
     page.wait_for_timeout(500)
 
 
-def extract_price(card, price_selector):
-    """Return first price element whose text contains a digit. Normalises nbsp."""
+def extract_price(card, price_selector, price_attr):
+    """
+    Extract price from a card element.
+    If price_attr is set, read that HTML attribute (e.g. data-primary-price="35990").
+    Otherwise scan inner text for the first element containing a digit.
+    Returns a formatted string like "35 990 kr" or None.
+    """
     try:
-        for el in card.query_selector_all(price_selector):
-            text = el.inner_text().strip().replace("\u00a0", "\u202f")
-            if any(c.isdigit() for c in text):
-                return text
+        el = card.query_selector(price_selector)
+        if not el:
+            return None
+
+        if price_attr:
+            raw = el.get_attribute(price_attr)
+            if raw and raw.isdigit():
+                # Format: 35990 -> "35 990 kr"
+                val = int(raw)
+                formatted = f"{val:,}".replace(",", " ") + " kr"
+                return formatted
+            return None
+        else:
+            # Scan all matching elements for one containing digits
+            for el in card.query_selector_all(price_selector):
+                text = el.inner_text().strip().replace("\u00a0", "\u202f")
+                if any(c.isdigit() for c in text):
+                    return text
     except Exception:
         pass
     return None
 
 
 def parse_price_value(price_str):
-    """Extract numeric value from a price string like '59 990 kr' -> 59990.0"""
+    """Extract numeric value: '35 990 kr' or '35990.-' -> 35990.0"""
     if not price_str:
         return None
     digits = "".join(c for c in price_str if c.isdigit())
@@ -105,88 +132,77 @@ def parse_price_value(price_str):
 
 
 def truncate(text, length=38):
-    return text if len(text) <= length else text[:length - 1] + "…"
+    return text if len(text) <= length else text[:length - 1] + "\u2026"
 
 
 # ---------------------------------------------------------------------------
 # Discord formatting
 # ---------------------------------------------------------------------------
 
-def build_table_embed(store_info, current_listings, prev_listings, changes):
-    """
-    Build a single rich Discord embed summarising all listings for one store.
-
-    current_listings: list of {"title": str, "price": str|None}
-    prev_listings:    dict keyed by title: {"price": str|None}  (from DB)
-    changes:          list of change dicts (new / price_drop / price_up / gone)
-    """
+def build_table_embed(store_info, current_listings, prev_store_data, changes):
     display_name = store_info["display_name"]
     store_url    = store_info["url"]
     has_changes  = bool(changes)
 
-    # ── Build the listing table (monospace code block) ──────────────────────
-    # Columns:  # | Product (38 chars) | Price
-    header = f"{'#':<3} {'Product':<38} {'Price':>12}"
-    divider = "─" * len(header)
-    rows = [header, divider]
+    # Build monospace table
+    header  = f"{'#':<3} {'Product':<38} {'Price':>12}"
+    divider = "\u2500" * len(header)
+    rows    = [header, divider]
 
     for i, item in enumerate(current_listings, 1):
         title_col = truncate(item["title"])
-        price_col = item["price"] if item["price"] else "—"
+        price_col = item["price"] if item["price"] else "\u2014"
 
-        # Mark changed rows with a leading symbol
         marker = "  "
         for c in changes:
             if c["title"] == item["title"]:
                 if c["type"] == "new":
-                    marker = "🆕"
+                    marker = "\U0001f195"   # NEW
                 elif c["type"] == "price_drop":
-                    marker = "📉"
+                    marker = "\U0001f4c9"   # chart down
                 elif c["type"] == "price_up":
-                    marker = "📈"
+                    marker = "\U0001f4c8"   # chart up
                 break
 
         rows.append(f"{marker}{i:<2} {title_col:<38} {price_col:>12}")
 
-    # Add any listings that disappeared this run
     gone_titles = [c["title"] for c in changes if c["type"] == "gone"]
     if gone_titles:
         rows.append(divider)
         rows.append("Gone this run:")
         for t in gone_titles:
-            rows.append(f"❌  {truncate(t)}")
+            rows.append(f"\u274c  {truncate(t)}")
 
     table_text = "```\n" + "\n".join(rows) + "\n```"
 
-    # ── Build change summary fields ─────────────────────────────────────────
+    # Change summary field
     fields = []
-
     if changes:
         change_lines = []
         for c in changes:
             if c["type"] == "new":
-                p = c.get("price") or "—"
-                change_lines.append(f"🆕 **New:** {c['title']}\n    Price: **{p}**")
+                p = c.get("price") or "\u2014"
+                change_lines.append(f"\U0001f195 **New:** {c['title']}\n    Price: **{p}**")
             elif c["type"] == "price_drop":
                 change_lines.append(
-                    f"📉 **Price drop:** {truncate(c['title'], 45)}\n"
-                    f"    {c['old_price']} → **{c['new_price']}**"
+                    f"\U0001f4c9 **Price drop:** {truncate(c['title'], 45)}\n"
+                    f"    {c['old_price']} \u2192 **{c['new_price']}**"
                 )
             elif c["type"] == "price_up":
                 change_lines.append(
-                    f"📈 **Price increase:** {truncate(c['title'], 42)}\n"
-                    f"    {c['old_price']} → {c['new_price']}"
+                    f"\U0001f4c8 **Price increase:** {truncate(c['title'], 42)}\n"
+                    f"    {c['old_price']} \u2192 {c['new_price']}"
                 )
             elif c["type"] == "gone":
-                change_lines.append(f"❌ **Gone:** {c['title']}")
+                change_lines.append(f"\u274c **Gone:** {c['title']}")
 
         fields.append({
-            "name": "⚡ Changes detected",
+            "name": "\u26a1 Changes detected",
             "value": "\n".join(change_lines),
             "inline": False,
         })
 
-    # ── Pick colour ─────────────────────────────────────────────────────────
+    # Colour
     if not current_listings:
         color = COLOR_GREY
     elif any(c["type"] in ("new", "price_drop") for c in changes):
@@ -196,17 +212,15 @@ def build_table_embed(store_info, current_listings, prev_listings, changes):
     else:
         color = COLOR_GREEN
 
-    # ── Status line ─────────────────────────────────────────────────────────
-    now_ts = int(time.time())
     if has_changes:
-        status = f"⚠️  {len(changes)} change(s) detected"
+        status = f"\u26a0\ufe0f  {len(changes)} change(s) detected"
     elif not current_listings:
-        status = "⚠️  No listings found"
+        status = "\u26a0\ufe0f  No listings found"
     else:
-        status = f"✅  {len(current_listings)} listing(s) — no changes"
+        status = f"\u2705  {len(current_listings)} listing(s) \u2014 no changes"
 
-    embed = {
-        "title": f"🖥️  RTX 5090 — {display_name}",
+    return {
+        "title": f"\U0001f5a5\ufe0f  RTX 5090 \u2014 {display_name}",
         "url": store_url,
         "description": table_text,
         "color": color,
@@ -215,19 +229,14 @@ def build_table_embed(store_info, current_listings, prev_listings, changes):
         "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
     }
 
-    return embed
-
 
 def send_summary(webhook_url, embeds, has_urgent_changes):
-    """Send up to 10 embeds in one webhook call. Prepend @here if urgent."""
     if not webhook_url:
-        print("  [Discord] DISCORD_WEBHOOK not set – skipping.")
+        print("  [Discord] DISCORD_WEBHOOK not set \u2013 skipping.")
         return
-
     payload = {"embeds": embeds}
     if has_urgent_changes:
         payload["content"] = "@here  New RTX 5090 listing or price drop detected!"
-
     try:
         r = requests.post(webhook_url, json=payload, timeout=10)
         r.raise_for_status()
@@ -241,12 +250,6 @@ def send_summary(webhook_url, embeds, has_urgent_changes):
 # ---------------------------------------------------------------------------
 
 def detect_changes(current_listings, prev_store_data):
-    """
-    Compare current scrape against previous run data.
-
-    prev_store_data: dict  { title: {"price": str|None, "first_seen": float} }
-    Returns list of change dicts.
-    """
     changes = []
     current_titles = {item["title"] for item in current_listings}
     prev_titles    = set(prev_store_data.keys())
@@ -254,14 +257,12 @@ def detect_changes(current_listings, prev_store_data):
     for item in current_listings:
         title = item["title"]
         price = item["price"]
-
         if title not in prev_store_data:
             changes.append({"type": "new", "title": title, "price": price})
         else:
             old_price_str = prev_store_data[title].get("price")
             old_val = parse_price_value(old_price_str)
             new_val = parse_price_value(price)
-
             if old_val is not None and new_val is not None:
                 if new_val < old_val:
                     changes.append({
@@ -324,7 +325,6 @@ def build_browser_and_context(playwright):
 def run_tracker():
     os.makedirs("/app/data/debug", exist_ok=True)
 
-    # DB structure: { "store_name": { "title": {"price": str, "first_seen": ts} } }
     db: dict = {}
     if os.path.exists(DB_FILE):
         try:
@@ -356,7 +356,7 @@ def run_tracker():
                     )
                     print(f"  Product list visible.")
                 except PlaywrightTimeoutError:
-                    print(f"  Timed out waiting for products – saving debug screenshot.")
+                    print(f"  Timed out waiting for products \u2013 saving debug screenshot.")
                     page.screenshot(path=f"/app/data/debug/{store}_timeout.png")
 
                 with open(f"/app/data/debug/{store}_dump.html", "w", encoding="utf-8") as f:
@@ -374,13 +374,11 @@ def run_tracker():
                     if not title:
                         title = (card.inner_text() or "")[:80].strip()
 
-                    price = None
-                    if info.get("price_selector"):
-                        price = extract_price(card, info["price_selector"])
+                    price = extract_price(card, info["price_selector"], info.get("price_attr"))
 
                     if "5090" in title:
                         current_listings.append({"title": title, "price": price})
-                        print(f"    + {title[:60]} | {price or '—'}")
+                        print(f"    + {title[:60]} | {price or 'no price'}")
 
             except PlaywrightTimeoutError as e:
                 print(f"  [Timeout] {str(e)[:150]}")
@@ -391,21 +389,17 @@ def run_tracker():
             except Exception as e:
                 print(f"  [Error] {str(e)[:150]}")
 
-            # ── Detect changes against last run ──────────────────────────────
             prev_store_data = db.get(store, {})
             changes = detect_changes(current_listings, prev_store_data)
-
             if changes:
                 print(f"  Changes: {[c['type'] for c in changes]}")
 
-            # ── Build embed for this store ────────────────────────────────────
             embed = build_table_embed(info, current_listings, prev_store_data, changes)
             all_embeds.append(embed)
 
             if any(c["type"] in ("new", "price_drop") for c in changes):
                 has_urgent_change = True
 
-            # ── Update DB for this store ──────────────────────────────────────
             new_store_data = {}
             for item in current_listings:
                 new_store_data[item["title"]] = {
@@ -423,8 +417,6 @@ def run_tracker():
         context.close()
         browser.close()
 
-    # ── Send one webhook call with all store embeds ──────────────────────────
-    # Discord allows max 10 embeds per message; we have 2 stores so we're fine.
     if all_embeds:
         send_summary(DISCORD_WEBHOOK_URL, all_embeds, has_urgent_change)
 
