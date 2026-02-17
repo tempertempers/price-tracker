@@ -1,6 +1,8 @@
 import os
+import re
 import time
 import json
+import html as html_lib
 import requests
 from pathlib import Path
 from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeoutError
@@ -28,7 +30,8 @@ STORES = {
         "price_selector": '[class*="pvyf6gm"] span[data-test-is-discounted-price]',
         "price_attr": None,
         "load_event": "domcontentloaded",
-        "browser": "chromium",          # which browser engine to use
+        "browser": "chromium",
+        "scrape_method": "dom",
         "display_name": "inet.se",
         "store_url": "https://www.inet.se",
         "title_filter": "5090",
@@ -45,45 +48,41 @@ STORES = {
         "price_attr": "data-primary-price",
         "load_event": "domcontentloaded",
         "browser": "chromium",
+        "scrape_method": "dom",
         "display_name": "Elgiganten",
         "store_url": "https://www.elgiganten.se",
         "title_filter": "5090",
     },
     "komplett": {
-        # Komplett's search page drops headless Chromium connections via HTTP/2
-        # fingerprinting at the CDN level. Firefox has a different TLS/H2
-        # fingerprint that gets through cleanly.
         "url": "https://www.komplett.se/search?q=rtx+5090",
-        # Each product row carries a data-product-id — stable semantic attribute
-        "wait_selector": "[data-product-id]",
-        "card_selector": "[data-product-id]",
-        # Title is in the first anchor with a product path, or an h2/h3
-        "title_selector": "a.product-link, h2, h3, [class*='name']",
-        # Price rendered as plain text "38 990:-" — caught by digit heuristic
-        "price_selector": "span, div",
-        "price_attr": None,
+        # Cookie banner: CookieInformation provider
+        # Products: embedded as JSON in preloadedsearchresult HTML attribute —
+        # no DOM card selectors needed, just parse the JSON directly.
+        "wait_selector": "[preloadedsearchresult]",
         "load_event": "domcontentloaded",
-        "browser": "firefox",           # Firefox bypasses Komplett's H2 fingerprint block
+        "browser": "firefox",       # Firefox bypasses Komplett's HTTP/2 fingerprint block
+        "scrape_method": "json",    # extract from preloadedsearchresult JSON attribute
         "display_name": "Komplett.se",
         "store_url": "https://www.komplett.se",
         "title_filter": "5090",
     },
     "webhallen": {
-        # Use the clean category URL — the long search URL with multiple &f= params
-        # causes a navigation abort in Playwright due to URL encoding edge cases.
-        # The category page for GPU (47) filtered to RTX 5090 is cleaner and stable.
         "url": "https://www.webhallen.com/se/search?searchString=rtx+5090",
-        # React SPA — wait for product cards to render after JS runs
-        "wait_selector": "li[class*='product'], article, [data-testid*='product'], li:has(a[href*='/se/product/'])",
-        "card_selector": "li:has(a[href*='/se/product/']), article[class*='product']",
-        "title_selector": "h3, h2, [class*='title'], [class*='name']",
-        "price_selector": "[class*='price'], [class*='Price'], span",
+        # Product cards: div.product-grid-item (each product appears twice — deduplicated below)
+        # Title: grid-link anchor title attribute
+        # Price: .price-value._right span text
+        "wait_selector": "div.product-grid-item",
+        "card_selector": "div.product-grid-item",
+        "title_selector": "a.grid-link",        # read title="" attribute, not inner text
+        "price_selector": ".price-value span",
         "price_attr": None,
         "load_event": "domcontentloaded",
         "browser": "chromium",
+        "scrape_method": "dom",
         "display_name": "Webhallen",
         "store_url": "https://www.webhallen.com",
-        "title_filter": "5090",
+        # Webhallen results include laptops — filter to standalone GPU cards only
+        "title_filter": "GeForce RTX 5090",
     },
 }
 
@@ -96,19 +95,22 @@ COLOR_GREY   = 0x95A5A6
 
 
 # ---------------------------------------------------------------------------
-# Helpers
+# Cookie popup handler
 # ---------------------------------------------------------------------------
 
 def handle_cookie_popup(page):
     selectors = [
+        # CookieInformation (Komplett)
+        "button[aria-label='Godkänn alla']",
+        "button[onclick*='submitAllCategories']",
+        # Generic Swedish/English
+        "button:has-text('Godkänn alla')",
+        "button:has-text('Acceptera alla')",
         "button:has-text('OK')",
         "button:has-text('Acceptera')",
-        "button:has-text('Acceptera alla')",
-        "button:has-text('Godkann alla')",
         "button:has-text('Godkann')",
         "button:has-text('Accept all')",
         "button:has-text('Accept')",
-        "button:has-text('Jag forstar')",
         "#CybotCookiebotDialogBodyLevelButtonLevelOptinAllowAll",
         "[id*='accept'][class*='cookie']",
     ]
@@ -122,21 +124,26 @@ def handle_cookie_popup(page):
                 return
         except Exception:
             pass
+    # Fallback: nuke overlay elements
     page.evaluate("""() => {
-        ['[role="dialog"]', '.modal', '[class*="cookie"]',
-         '[class*="overlay"]', '[class*="consent"]', '#onetrust-banner-sdk']
+        ['[role="dialog"]', '.modal', '[class*="cookie"]', '[id*="cookie"]',
+         '[class*="overlay"]', '[class*="consent"]', '#onetrust-banner-sdk',
+         '#cookie-information-template-wrapper']
         .forEach(s => document.querySelectorAll(s).forEach(el => el.remove()));
     }""")
     page.wait_for_timeout(500)
 
 
-def extract_price(card, price_selector, price_attr):
+# ---------------------------------------------------------------------------
+# Price extraction
+# ---------------------------------------------------------------------------
+
+def extract_price_dom(card, price_selector, price_attr):
     """
-    Extract price from a card element.
-    - If price_attr set: read that attribute directly (e.g. data-primary-price="35990")
-      and return formatted as "35 990 kr".
-    - Otherwise: scan child elements for text that looks like a price
-      (contains digits + "kr" or ":-", or is a bare number >= 1000).
+    Extract price from a DOM card element.
+    If price_attr set: read that attribute (e.g. data-primary-price="35990")
+    and format as "35 990 kr".
+    Otherwise: scan child elements for text containing digits + "kr" or ":-".
     """
     try:
         if price_attr:
@@ -146,8 +153,7 @@ def extract_price(card, price_selector, price_attr):
             raw = el.get_attribute(price_attr)
             if raw and raw.isdigit():
                 val = int(raw)
-                formatted = f"{val:,}".replace(",", "\u202f") + " kr"
-                return formatted
+                return f"{val:,}".replace(",", "\u202f") + " kr"
             return None
 
         for el in card.query_selector_all(price_selector):
@@ -170,6 +176,43 @@ def extract_price(card, price_selector, price_attr):
     return None
 
 
+def parse_komplett_json(page_html, title_filter):
+    """
+    Komplett embeds all search results as HTML-entity-encoded JSON in a
+    preloadedsearchresult attribute. Parse it directly — no DOM scraping needed.
+    Returns list of {"title": str, "price": str}.
+    """
+    listings = []
+    match = re.search(r'preloadedsearchresult="([^"]+)"', page_html)
+    if not match:
+        print("  [Komplett] preloadedsearchresult attribute not found in HTML.")
+        return listings
+    try:
+        decoded = html_lib.unescape(match.group(1))
+        data = json.loads(decoded)
+        products = data.get("products", [])
+        print(f"  [Komplett] {len(products)} products in preloaded JSON.")
+        for p in products:
+            name = p.get("name", "")
+            if title_filter not in name:
+                continue
+            # Skip complete PCs and laptops
+            if any(kw in name for kw in ["Komplett-PC", "Predator", "Legion", "OMEN", "Zephyrus"]):
+                continue
+            price_str = p.get("price", {}).get("listPrice", None)
+            if price_str:
+                # Normalise "35 490:-" → "35 490 kr"
+                price_str = price_str.replace("\u00a0", " ").replace(":-", " kr").strip()
+            listings.append({"title": name, "price": price_str})
+    except Exception as e:
+        print(f"  [Komplett] JSON parse error: {e}")
+    return listings
+
+
+# ---------------------------------------------------------------------------
+# Change detection
+# ---------------------------------------------------------------------------
+
 def parse_price_value(price_str):
     if not price_str:
         return None
@@ -177,13 +220,49 @@ def parse_price_value(price_str):
     return float(digits) if digits else None
 
 
-def truncate(text, length=38):
-    return text if len(text) <= length else text[:length - 1] + "\u2026"
+def detect_changes(current_listings, prev_store_data):
+    changes = []
+    current_titles = {item["title"] for item in current_listings}
+    prev_titles    = set(prev_store_data.keys())
+
+    for item in current_listings:
+        title = item["title"]
+        price = item["price"]
+        if title not in prev_store_data:
+            changes.append({"type": "new", "title": title, "price": price})
+        else:
+            old_price_str = prev_store_data[title].get("price")
+            old_val = parse_price_value(old_price_str)
+            new_val = parse_price_value(price)
+            if old_val is not None and new_val is not None:
+                if new_val < old_val:
+                    changes.append({
+                        "type": "price_drop",
+                        "title": title,
+                        "old_price": old_price_str,
+                        "new_price": price,
+                    })
+                elif new_val > old_val:
+                    changes.append({
+                        "type": "price_up",
+                        "title": title,
+                        "old_price": old_price_str,
+                        "new_price": price,
+                    })
+
+    for title in prev_titles - current_titles:
+        changes.append({"type": "gone", "title": title})
+
+    return changes
 
 
 # ---------------------------------------------------------------------------
 # Discord formatting
 # ---------------------------------------------------------------------------
+
+def truncate(text, length=38):
+    return text if len(text) <= length else text[:length - 1] + "\u2026"
+
 
 def build_table_embed(store_info, current_listings, prev_store_data, changes, is_first_run):
     display_name = store_info["display_name"]
@@ -200,12 +279,9 @@ def build_table_embed(store_info, current_listings, prev_store_data, changes, is
         marker = "  "
         for c in changes:
             if c["title"] == item["title"]:
-                if c["type"] == "new":
-                    marker = "\U0001f195"
-                elif c["type"] == "price_drop":
-                    marker = "\U0001f4c9"
-                elif c["type"] == "price_up":
-                    marker = "\U0001f4c8"
+                if c["type"] == "new":        marker = "\U0001f195"
+                elif c["type"] == "price_drop": marker = "\U0001f4c9"
+                elif c["type"] == "price_up":   marker = "\U0001f4c8"
                 break
         rows.append(f"{marker}{i:<2} {title_col:<38} {price_col:>12}")
 
@@ -289,59 +365,11 @@ def send_summary(webhook_url, embeds, has_urgent_changes, is_first_run):
 
 
 # ---------------------------------------------------------------------------
-# Change detection
-# ---------------------------------------------------------------------------
-
-def detect_changes(current_listings, prev_store_data):
-    changes = []
-    current_titles = {item["title"] for item in current_listings}
-    prev_titles    = set(prev_store_data.keys())
-
-    for item in current_listings:
-        title = item["title"]
-        price = item["price"]
-        if title not in prev_store_data:
-            changes.append({"type": "new", "title": title, "price": price})
-        else:
-            old_price_str = prev_store_data[title].get("price")
-            old_val = parse_price_value(old_price_str)
-            new_val = parse_price_value(price)
-            if old_val is not None and new_val is not None:
-                if new_val < old_val:
-                    changes.append({
-                        "type": "price_drop",
-                        "title": title,
-                        "old_price": old_price_str,
-                        "new_price": price,
-                    })
-                elif new_val > old_val:
-                    changes.append({
-                        "type": "price_up",
-                        "title": title,
-                        "old_price": old_price_str,
-                        "new_price": price,
-                    })
-
-    for title in prev_titles - current_titles:
-        changes.append({"type": "gone", "title": title})
-
-    return changes
-
-
-# ---------------------------------------------------------------------------
-# Browser setup — one Chromium and one Firefox instance, created on demand
+# Browser setup
 # ---------------------------------------------------------------------------
 
 def get_or_create_page(browsers, contexts, pages, engine, playwright):
-    """
-    Return the page for the given engine ("chromium" or "firefox").
-    Creates the browser + context + page lazily on first use.
-    Firefox is used for Komplett to bypass HTTP/2 fingerprint blocking.
-    Chromium is used for all other stores.
-    """
     if engine not in pages:
-        common_args = ["--no-sandbox", "--disable-setuid-sandbox"]
-
         if engine == "firefox":
             browser = playwright.firefox.launch(headless=True)
             context_kwargs = {
@@ -356,7 +384,8 @@ def get_or_create_page(browsers, contexts, pages, engine, playwright):
         else:
             browser = playwright.chromium.launch(
                 headless=True,
-                args=common_args + ["--disable-blink-features=AutomationControlled"],
+                args=["--no-sandbox", "--disable-setuid-sandbox",
+                      "--disable-blink-features=AutomationControlled"],
             )
             context_kwargs = {
                 "viewport": {"width": 1920, "height": 1080},
@@ -368,18 +397,15 @@ def get_or_create_page(browsers, contexts, pages, engine, playwright):
                 "locale": "sv-SE",
                 "timezone_id": "Europe/Stockholm",
             }
-            # Restore saved cookie state for Chromium only
             if Path(STATE_FILE).exists():
                 context_kwargs["storage_state"] = STATE_FILE
-                print(f"  [Browser:{engine}] Restored saved cookie state.")
+                print(f"  [Browser:chromium] Restored saved cookie state.")
 
         context = browser.new_context(**context_kwargs)
-
         if engine == "chromium":
             context.add_init_script(
                 "Object.defineProperty(navigator, 'webdriver', { get: () => undefined });"
             )
-
         browsers[engine] = browser
         contexts[engine] = context
         pages[engine]    = context.new_page()
@@ -408,9 +434,9 @@ def run_tracker():
     send_this_run     = False
 
     with sync_playwright() as p:
-        browsers  = {}
-        contexts  = {}
-        pages     = {}
+        browsers = {}
+        contexts = {}
+        pages    = {}
 
         for store, info in STORES.items():
             print(f"\n--- Checking {store} ---")
@@ -420,7 +446,6 @@ def run_tracker():
 
             try:
                 page = get_or_create_page(browsers, contexts, pages, engine, p)
-
                 page.goto(info["url"], wait_until=info["load_event"], timeout=60_000)
                 handle_cookie_popup(page)
 
@@ -430,39 +455,59 @@ def run_tracker():
                         timeout=WAIT_FOR_CONTENT_TIMEOUT,
                         state="visible",
                     )
-                    print(f"  Product list visible.")
+                    print(f"  Content visible.")
                 except PlaywrightTimeoutError:
-                    print(f"  Timed out waiting for products \u2013 saving debug screenshot.")
+                    print(f"  Timed out waiting for content \u2013 saving debug screenshot.")
                     page.screenshot(path=f"/app/data/debug/{store}_timeout.png")
 
+                page_html = page.content()
                 with open(f"/app/data/debug/{store}_dump.html", "w", encoding="utf-8") as f:
-                    f.write(page.content())
+                    f.write(page_html)
                 print(f"  Debug HTML saved.")
 
-                cards = page.query_selector_all(info["card_selector"])
-                print(f"  Found {len(cards)} cards.")
-
-                if not cards:
-                    page.screenshot(path=f"/app/data/debug/{store}_empty.png")
-
+                # ── Scrape ────────────────────────────────────────────────
+                method = info.get("scrape_method", "dom")
                 title_filter = info.get("title_filter", "5090")
 
-                for card in cards:
-                    title_el = card.query_selector(info["title_selector"])
-                    title = title_el.inner_text().strip() if title_el else ""
-                    if not title:
-                        title = (card.inner_text() or "")[:80].strip()
+                if method == "json":
+                    # Komplett: parse preloadedsearchresult JSON attribute
+                    current_listings = parse_komplett_json(page_html, title_filter)
+                    for item in current_listings:
+                        print(f"    + {item['title'][:60]} | {item['price'] or 'no price'}")
 
-                    price = extract_price(card, info["price_selector"], info.get("price_attr"))
+                else:
+                    # Standard DOM scraping (inet, elgiganten, webhallen)
+                    cards = page.query_selector_all(info["card_selector"])
+                    print(f"  Found {len(cards)} cards.")
+                    if not cards:
+                        page.screenshot(path=f"/app/data/debug/{store}_empty.png")
 
-                    if title_filter in title:
-                        current_listings.append({"title": title, "price": price})
-                        print(f"    + {title[:60]} | {price or 'no price'}")
+                    seen_titles = set()  # deduplicate (Webhallen renders each card twice)
+                    for card in cards:
+                        # For Webhallen: title comes from the anchor's title="" attribute
+                        if store == "webhallen":
+                            anchor = card.query_selector("a.grid-link")
+                            title = anchor.get_attribute("title") if anchor else ""
+                            title = (title or "").strip()
+                        else:
+                            title_el = card.query_selector(info["title_selector"])
+                            title = title_el.inner_text().strip() if title_el else ""
+                        if not title:
+                            title = (card.inner_text() or "")[:80].strip()
+
+                        price = extract_price_dom(
+                            card, info.get("price_selector", ""), info.get("price_attr")
+                        )
+
+                        if title_filter in title and title not in seen_titles:
+                            seen_titles.add(title)
+                            current_listings.append({"title": title, "price": price})
+                            print(f"    + {title[:60]} | {price or 'no price'}")
 
             except PlaywrightTimeoutError as e:
                 print(f"  [Timeout] {str(e)[:150]}")
                 try:
-                    pages.get(engine, None) and pages[engine].screenshot(
+                    pages.get(engine) and pages[engine].screenshot(
                         path=f"/app/data/debug/{store}_timeout.png"
                     )
                 except Exception:
@@ -495,7 +540,6 @@ def run_tracker():
                 }
             db[store] = new_store_data
 
-        # Save Chromium cookie state for next run
         try:
             if "chromium" in contexts:
                 contexts["chromium"].storage_state(path=STATE_FILE)
@@ -503,17 +547,16 @@ def run_tracker():
         except Exception as e:
             print(f"\n  [Browser] Could not save cookie state: {e}")
 
-        # Clean up all browsers
-        for engine, browser in browsers.items():
+        for engine in list(browsers.keys()):
             try:
                 contexts[engine].close()
-                browser.close()
+                browsers[engine].close()
             except Exception:
                 pass
 
     if all_embeds:
         if not SILENT_IF_NO_CHANGES or send_this_run:
-            send_summary(DISCORD_WEBHOOK_URL, all_embeds, has_urgent_change, not send_this_run)
+            send_summary(DISCORD_WEBHOOK_URL, all_embeds, has_urgent_change, False)
         else:
             print("  [Discord] No changes \u2013 silent run.")
 
