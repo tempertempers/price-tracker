@@ -11,8 +11,8 @@ CHECK_INTERVAL = 300
 DB_FILE = "/app/data/tracker_db.json"
 STATE_FILE = "/app/data/storage_state.json"
 
-# Controls whether Discord sends a message on every run (False)
-# or only when something has changed after the first run (True).
+# After the first run per store (initial snapshot), only send Discord
+# messages when something has actually changed.
 SILENT_IF_NO_CHANGES = True
 
 STORES = {
@@ -25,12 +25,13 @@ STORES = {
         "wait_selector": 'li[data-test-id^="search_product"]',
         "card_selector": 'li[data-test-id^="search_product"]',
         "title_selector": "h3",
-        # Shelf price is in div.pvyf6gm - avoids 799kr game voucher promo spans
         "price_selector": '[class*="pvyf6gm"] span[data-test-is-discounted-price]',
         "price_attr": None,
         "load_event": "domcontentloaded",
+        "browser": "chromium",          # which browser engine to use
         "display_name": "inet.se",
         "store_url": "https://www.inet.se",
+        "title_filter": "5090",
     },
     "elgiganten": {
         "url": (
@@ -40,51 +41,53 @@ STORES = {
         "wait_selector": 'li[data-cro="product-item"]',
         "card_selector": 'li[data-cro="product-item"]',
         "title_selector": "h2",
-        # data-primary-price attribute holds a raw integer e.g. "35990"
         "price_selector": "[data-primary-price]",
         "price_attr": "data-primary-price",
         "load_event": "domcontentloaded",
+        "browser": "chromium",
         "display_name": "Elgiganten",
         "store_url": "https://www.elgiganten.se",
+        "title_filter": "5090",
     },
     "komplett": {
-        # list_view=list gives a denser HTML layout - easier to scrape
-        "url": "https://www.komplett.se/search?q=rtx+5090&list_view=list",
-        # Each product row has a data-product-id attribute - stable semantic selector
+        # Komplett's search page drops headless Chromium connections via HTTP/2
+        # fingerprinting at the CDN level. Firefox has a different TLS/H2
+        # fingerprint that gets through cleanly.
+        "url": "https://www.komplett.se/search?q=rtx+5090",
+        # Each product row carries a data-product-id — stable semantic attribute
         "wait_selector": "[data-product-id]",
         "card_selector": "[data-product-id]",
-        "title_selector": "a.product-link, h2, h1, [class*='name'], [class*='title']",
-        # Price shown as "38 990:-" in a span - no class*='price' needed
-        # Will be caught by the digit-filter in extract_price()
+        # Title is in the first anchor with a product path, or an h2/h3
+        "title_selector": "a.product-link, h2, h3, [class*='name']",
+        # Price rendered as plain text "38 990:-" — caught by digit heuristic
         "price_selector": "span, div",
         "price_attr": None,
         "load_event": "domcontentloaded",
+        "browser": "firefox",           # Firefox bypasses Komplett's H2 fingerprint block
         "display_name": "Komplett.se",
         "store_url": "https://www.komplett.se",
-        # Extra filter: only cards whose title contains this string
         "title_filter": "5090",
     },
     "webhallen": {
-        "url": (
-            "https://www.webhallen.com/se/search"
-            "?searchString=rtx+5090"
-            "&f=attributes%5Ecustom.cnet_videoutgang_grafikkort_110-1-NVIDIA%20GeForce%20RTX%205090"
-            "&f=category-filter%5Ecategory-1-47"
-        ),
-        # React SPA - product cards render inside a list after JS runs
-        "wait_selector": "article, [class*='product'], [data-testid*='product'], li a[href*='/se/product/']",
-        "card_selector": "article, [class*='product-card'], li:has(a[href*='/se/product/'])",
+        # Use the clean category URL — the long search URL with multiple &f= params
+        # causes a navigation abort in Playwright due to URL encoding edge cases.
+        # The category page for GPU (47) filtered to RTX 5090 is cleaner and stable.
+        "url": "https://www.webhallen.com/se/search?searchString=rtx+5090",
+        # React SPA — wait for product cards to render after JS runs
+        "wait_selector": "li[class*='product'], article, [data-testid*='product'], li:has(a[href*='/se/product/'])",
+        "card_selector": "li:has(a[href*='/se/product/']), article[class*='product']",
         "title_selector": "h3, h2, [class*='title'], [class*='name']",
         "price_selector": "[class*='price'], [class*='Price'], span",
         "price_attr": None,
         "load_event": "domcontentloaded",
+        "browser": "chromium",
         "display_name": "Webhallen",
         "store_url": "https://www.webhallen.com",
         "title_filter": "5090",
     },
 }
 
-WAIT_FOR_CONTENT_TIMEOUT = 20_000
+WAIT_FOR_CONTENT_TIMEOUT = 25_000
 
 COLOR_GREEN  = 0x2ECC71
 COLOR_RED    = 0xE74C3C
@@ -130,11 +133,10 @@ def handle_cookie_popup(page):
 def extract_price(card, price_selector, price_attr):
     """
     Extract price from a card element.
-    If price_attr is set, read that HTML attribute directly (e.g. data-primary-price="35990")
-    and format it as "35 990 kr".
-    Otherwise scan all matching child elements for the first text that contains
-    a digit AND looks like a price (contains 'kr' or ':-' or is a bare number >= 1000).
-    Returns a formatted string or None.
+    - If price_attr set: read that attribute directly (e.g. data-primary-price="35990")
+      and return formatted as "35 990 kr".
+    - Otherwise: scan child elements for text that looks like a price
+      (contains digits + "kr" or ":-", or is a bare number >= 1000).
     """
     try:
         if price_attr:
@@ -148,7 +150,6 @@ def extract_price(card, price_selector, price_attr):
                 return formatted
             return None
 
-        # Text-based extraction with price heuristic
         for el in card.query_selector_all(price_selector):
             try:
                 text = el.inner_text().strip().replace("\u00a0", " ").replace("\u202f", " ")
@@ -156,7 +157,6 @@ def extract_price(card, price_selector, price_attr):
                 continue
             if not any(c.isdigit() for c in text):
                 continue
-            # Must look like a price: contains "kr" or ":-" or is numeric >= 1000
             digits_only = "".join(c for c in text if c.isdigit())
             if not digits_only:
                 continue
@@ -171,7 +171,6 @@ def extract_price(card, price_selector, price_attr):
 
 
 def parse_price_value(price_str):
-    """'35 990 kr' or '38990:-' -> 35990.0"""
     if not price_str:
         return None
     digits = "".join(c for c in price_str if c.isdigit())
@@ -191,7 +190,6 @@ def build_table_embed(store_info, current_listings, prev_store_data, changes, is
     store_url    = store_info["url"]
     has_changes  = bool(changes)
 
-    # Build monospace table
     header  = f"{'#':<3} {'Product':<38} {'Price':>12}"
     divider = "\u2500" * len(header)
     rows    = [header, divider]
@@ -220,7 +218,6 @@ def build_table_embed(store_info, current_listings, prev_store_data, changes, is
 
     table_text = "```\n" + "\n".join(rows) + "\n```"
 
-    # Change summary field
     fields = []
     if has_changes and not is_first_run:
         change_lines = []
@@ -247,7 +244,6 @@ def build_table_embed(store_info, current_listings, prev_store_data, changes, is
                 "inline": False,
             })
 
-    # Colour
     if not current_listings:
         color = COLOR_GREY
     elif has_changes and not is_first_run and any(c["type"] in ("new", "price_drop") for c in changes):
@@ -258,7 +254,7 @@ def build_table_embed(store_info, current_listings, prev_store_data, changes, is
         color = COLOR_GREEN
 
     if is_first_run:
-        status = f"\U0001f4cb Initial snapshot: {len(current_listings)} listing(s)"
+        status = f"\U0001f4cb Initial snapshot \u2014 {len(current_listings)} listing(s)"
     elif has_changes:
         status = f"\u26a0\ufe0f  {len(changes)} change(s) detected"
     elif not current_listings:
@@ -282,7 +278,6 @@ def send_summary(webhook_url, embeds, has_urgent_changes, is_first_run):
         print("  [Discord] DISCORD_WEBHOOK not set \u2013 skipping.")
         return
     payload = {"embeds": embeds}
-    # Only @here ping on real changes after the first run
     if has_urgent_changes and not is_first_run:
         payload["content"] = "@here  New RTX 5090 listing or price drop detected!"
     try:
@@ -334,36 +329,63 @@ def detect_changes(current_listings, prev_store_data):
 
 
 # ---------------------------------------------------------------------------
-# Browser setup
+# Browser setup — one Chromium and one Firefox instance, created on demand
 # ---------------------------------------------------------------------------
 
-def build_browser_and_context(playwright):
-    browser = playwright.chromium.launch(
-        headless=True,
-        args=[
-            "--no-sandbox",
-            "--disable-setuid-sandbox",
-            "--disable-blink-features=AutomationControlled",
-        ],
-    )
-    context_kwargs = {
-        "viewport": {"width": 1920, "height": 1080},
-        "user_agent": (
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-            "AppleWebKit/537.36 (KHTML, like Gecko) "
-            "Chrome/121.0.0.0 Safari/537.36"
-        ),
-        "locale": "sv-SE",
-        "timezone_id": "Europe/Stockholm",
-    }
-    if Path(STATE_FILE).exists():
-        context_kwargs["storage_state"] = STATE_FILE
-        print("  [Browser] Restored saved cookie state.")
-    context = browser.new_context(**context_kwargs)
-    context.add_init_script(
-        "Object.defineProperty(navigator, 'webdriver', { get: () => undefined });"
-    )
-    return browser, context
+def get_or_create_page(browsers, contexts, pages, engine, playwright):
+    """
+    Return the page for the given engine ("chromium" or "firefox").
+    Creates the browser + context + page lazily on first use.
+    Firefox is used for Komplett to bypass HTTP/2 fingerprint blocking.
+    Chromium is used for all other stores.
+    """
+    if engine not in pages:
+        common_args = ["--no-sandbox", "--disable-setuid-sandbox"]
+
+        if engine == "firefox":
+            browser = playwright.firefox.launch(headless=True)
+            context_kwargs = {
+                "viewport": {"width": 1920, "height": 1080},
+                "user_agent": (
+                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:122.0) "
+                    "Gecko/20100101 Firefox/122.0"
+                ),
+                "locale": "sv-SE",
+                "timezone_id": "Europe/Stockholm",
+            }
+        else:
+            browser = playwright.chromium.launch(
+                headless=True,
+                args=common_args + ["--disable-blink-features=AutomationControlled"],
+            )
+            context_kwargs = {
+                "viewport": {"width": 1920, "height": 1080},
+                "user_agent": (
+                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                    "AppleWebKit/537.36 (KHTML, like Gecko) "
+                    "Chrome/121.0.0.0 Safari/537.36"
+                ),
+                "locale": "sv-SE",
+                "timezone_id": "Europe/Stockholm",
+            }
+            # Restore saved cookie state for Chromium only
+            if Path(STATE_FILE).exists():
+                context_kwargs["storage_state"] = STATE_FILE
+                print(f"  [Browser:{engine}] Restored saved cookie state.")
+
+        context = browser.new_context(**context_kwargs)
+
+        if engine == "chromium":
+            context.add_init_script(
+                "Object.defineProperty(navigator, 'webdriver', { get: () => undefined });"
+            )
+
+        browsers[engine] = browser
+        contexts[engine] = context
+        pages[engine]    = context.new_page()
+        print(f"  [Browser:{engine}] Launched.")
+
+    return pages[engine]
 
 
 # ---------------------------------------------------------------------------
@@ -381,24 +403,24 @@ def run_tracker():
         except Exception:
             db = {}
 
-    # A store is "first run" if it has never been scraped before
-    def is_first_run(store):
-        return store not in db
-
     all_embeds        = []
     has_urgent_change = False
-    send_this_run     = False   # will be set True if there's anything worth sending
+    send_this_run     = False
 
     with sync_playwright() as p:
-        browser, context = build_browser_and_context(p)
-        page = context.new_page()
+        browsers  = {}
+        contexts  = {}
+        pages     = {}
 
         for store, info in STORES.items():
             print(f"\n--- Checking {store} ---")
             current_listings = []
-            first_run = is_first_run(store)
+            first_run = store not in db
+            engine = info.get("browser", "chromium")
 
             try:
+                page = get_or_create_page(browsers, contexts, pages, engine, p)
+
                 page.goto(info["url"], wait_until=info["load_event"], timeout=60_000)
                 handle_cookie_popup(page)
 
@@ -415,6 +437,7 @@ def run_tracker():
 
                 with open(f"/app/data/debug/{store}_dump.html", "w", encoding="utf-8") as f:
                     f.write(page.content())
+                print(f"  Debug HTML saved.")
 
                 cards = page.query_selector_all(info["card_selector"])
                 print(f"  Found {len(cards)} cards.")
@@ -439,33 +462,29 @@ def run_tracker():
             except PlaywrightTimeoutError as e:
                 print(f"  [Timeout] {str(e)[:150]}")
                 try:
-                    page.screenshot(path=f"/app/data/debug/{store}_timeout.png")
+                    pages.get(engine, None) and pages[engine].screenshot(
+                        path=f"/app/data/debug/{store}_timeout.png"
+                    )
                 except Exception:
                     pass
             except Exception as e:
-                print(f"  [Error] {str(e)[:150]}")
+                print(f"  [Error] {str(e)[:200]}")
 
             prev_store_data = db.get(store, {})
             changes = detect_changes(current_listings, prev_store_data)
-
             if changes:
-                c_types = [c["type"] for c in changes]
-                print(f"  Changes: {c_types}")
+                print(f"  Changes: {[c['type'] for c in changes]}")
 
             embed = build_table_embed(info, current_listings, prev_store_data, changes, first_run)
             all_embeds.append(embed)
 
-            # Decide if we need to send Discord this run
             if first_run:
-                # Always send on the very first scrape of a store (initial snapshot)
                 send_this_run = True
             elif changes:
                 send_this_run = True
                 if any(c["type"] in ("new", "price_drop") for c in changes):
                     has_urgent_change = True
-            # else: silent if SILENT_IF_NO_CHANGES is True
 
-            # Update DB
             new_store_data = {}
             for item in current_listings:
                 new_store_data[item["title"]] = {
@@ -476,20 +495,27 @@ def run_tracker():
                 }
             db[store] = new_store_data
 
+        # Save Chromium cookie state for next run
         try:
-            context.storage_state(path=STATE_FILE)
-        except Exception:
-            pass
-        context.close()
-        browser.close()
+            if "chromium" in contexts:
+                contexts["chromium"].storage_state(path=STATE_FILE)
+                print("\n  [Browser:chromium] Cookie state saved.")
+        except Exception as e:
+            print(f"\n  [Browser] Could not save cookie state: {e}")
 
-    # Send only if there's something worth reporting
-    # If SILENT_IF_NO_CHANGES is True, skip runs with no changes
+        # Clean up all browsers
+        for engine, browser in browsers.items():
+            try:
+                contexts[engine].close()
+                browser.close()
+            except Exception:
+                pass
+
     if all_embeds:
         if not SILENT_IF_NO_CHANGES or send_this_run:
-            send_summary(DISCORD_WEBHOOK_URL, all_embeds, has_urgent_change, False)
+            send_summary(DISCORD_WEBHOOK_URL, all_embeds, has_urgent_change, not send_this_run)
         else:
-            print("  [Discord] No changes detected \u2013 silent run (no message sent).")
+            print("  [Discord] No changes \u2013 silent run.")
 
     with open(DB_FILE, "w") as f:
         json.dump(db, f, indent=2)
