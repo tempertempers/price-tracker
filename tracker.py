@@ -13,27 +13,26 @@ STATE_FILE = "/app/data/storage_state.json"
 
 STORES = {
     "inet": {
-        "url": "https://www.inet.se/hitta?q=5090&filter=%7B%22query%22%3A%22RTX%205090%22%2C%22templateId%22%3A17%7D&sortColumn=search&sortDirection=desc",
-        "card_selector": ".product, .product-list__item",
-        "title_selector": ".product__title, .product-name",
-        "price_selector": None
+        "url": "https://www.inet.se/hitta?filter=%7B%22query%22%3A%22RTX+5090%22%2C%22templateId%22%3A17%7D&q=5090",
+        "card_selector": "li[class*='product-list__item'], div[class*='product']",
+        "title_selector": "h3, a span",
+        "price_selector": "[data-test-is-discounted-price], [class*='price']"
     },
     "elgiganten": {
-        "url": "https://www.elgiganten.se/gaming/datorkomponenter/grafikkort-gpu?gad_campaignid=1506298985&f=30877%3AGeForce%2520RTX%25205090",
+        "url": "https://www.elgiganten.se/gaming/datorkomponenter/grafikkort-gpu?f=30877%3AGeForce%2520RTX%25205090",
         "card_selector": "div.product-tile, article.product-tile",
-        "title_selector": "h3, .product-name",
+        "title_selector": ".product-name, h3",
         "price_selector": "span.font-headline"
     },
     "netonnet": {
         "url": "https://www.netonnet.se/search?query=RTX%205090%20grafikkort",
-        "card_selector": ".productItem, .product-card-container",
+        "card_selector": ".product-card-container, .productItem",
         "title_selector": ".title, h2",
-        "price_selector": None
+        "price_selector": "[class*='price']"
     }
 }
 
 def handle_cookie_popup(page):
-    # Försök klicka på vanliga accept-knappar
     selectors = [
         "button:has-text('OK')",
         "button:has-text('Acceptera')",
@@ -49,32 +48,26 @@ def handle_cookie_popup(page):
             return
         except:
             pass
-
-    # Om klick ej fungerade → ta bort popup/overlay
     page.evaluate("""
         () => {
-            document.querySelectorAll('[role="dialog"], .modal, .cookie-banner, .overlay').forEach(el => el.remove());
+            document.querySelectorAll('[role="dialog"], .modal, .cookie, .overlay').forEach(el => el.remove());
         }
     """)
     page.wait_for_timeout(1000)
 
 def create_or_restore_context(playwright):
-    # Om state finns, återanvänd cookie/state
     if Path(STATE_FILE).exists():
         return playwright.chromium.launch().new_context(storage_state=STATE_FILE)
 
-    # Annars skapa ny, godkänn cookie, spara state
     browser = playwright.chromium.launch(headless=True)
     context = browser.new_context(
         viewport={"width": 1920, "height": 1080},
-        user_agent=("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
-                     " Chrome/121.0.0.0 Safari/537.36")
+        user_agent=("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                     "AppleWebKit/537.36 Chrome/121.0.0.0 Safari/537.36")
     )
     page = context.new_page()
-    # Navigera till någon sida för att trigga cookie popup
-    page.goto("https://www.elgiganten.se", wait_until="networkidle")
+    page.goto("https://www.inet.se", wait_until="networkidle")
     handle_cookie_popup(page)
-    # Spara state efter accept
     context.storage_state(path=STATE_FILE)
     page.close()
     return browser.new_context(storage_state=STATE_FILE)
@@ -90,7 +83,6 @@ def run_tracker():
             history = {}
 
     with sync_playwright() as p:
-        # skapa/återställ cookie-context
         context = create_or_restore_context(p)
         page = context.new_page()
 
@@ -100,25 +92,27 @@ def run_tracker():
                 page.goto(info["url"], wait_until="networkidle", timeout=60000)
 
                 handle_cookie_popup(page)
-                page.wait_for_timeout(2000)
 
-                # spara HTML-dump
+                try:
+                    page.wait_for_selector(info["card_selector"], timeout=15000)
+                except:
+                    print(f"  No product list rendered yet for {store}")
+
                 html = page.content()
                 with open(f"/app/data/debug/{store}_dump.html", "w", encoding="utf-8") as f:
                     f.write(html)
                 print(f"  Saved debug HTML for {store}.")
 
                 cards = page.query_selector_all(info["card_selector"])
-                print(f"  Found {len(cards)} items.")
+                print(f"  Found {len(cards)} items on page.")
 
                 if len(cards) == 0:
                     page.screenshot(path=f"/app/data/debug/{store}_empty.png")
-                    print("  No products found, screenshot saved.")
+                    print(f"  No products found, screenshot saved.")
 
                 for card in cards:
                     title_el = card.query_selector(info["title_selector"])
                     title = title_el.inner_text().strip() if title_el else "NO TITLE"
-
                     price_text = None
                     if info["price_selector"]:
                         try:
@@ -127,14 +121,14 @@ def run_tracker():
                         except:
                             price_text = None
 
-                    print(f"    - {title[:50]} | {price_text}")
+                    print(f"    • {title[:60]} | {price_text}")
 
                     if "5090" in title and price_text:
                         key = f"{store}-{title}-{price_text}"
                         if key not in history:
                             requests.post(DISCORD_WEBHOOK_URL, json={
                                 "embeds": [{
-                                    "title": "🚀 RTX 5090 Found!",
+                                    "title": "🚀 RTX 5090 prisuppdatering!",
                                     "description": f"{title}\n{price_text}",
                                     "url": info["url"],
                                     "color": 15158332
@@ -143,7 +137,7 @@ def run_tracker():
                             history[key] = time.time()
 
             except Exception as e:
-                print(f"  [Error] {store}: {str(e)[:150]}")
+                print(f"  [Error] {store}: {str(e)[:200]}")
 
         context.close()
 
