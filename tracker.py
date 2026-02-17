@@ -18,41 +18,45 @@ STORES = {
             "&filter=%7B%22query%22%3A%22RTX%205090%22%2C%22templateId%22%3A17%7D"
             "&sortColumn=search&sortDirection=desc"
         ),
-        # inet keeps analytics pings alive so networkidle never resolves —
-        # use domcontentloaded + explicit wait_for_selector instead.
-        "wait_selector": "a.product-card, .product-list-item, article[data-product-id], .product",
-        "card_selector": "a.product-card, .product-list-item, article[data-product-id], .product",
-        "title_selector": "h2, h3, .product-name, .title, [class*='title']",
-        "price_selector": ".price, [class*='price']",
+        # Confirmed from debug HTML: products are <li data-test-id="search_product_XXXXXX">
+        # This is a stable semantic selector that won't break on CSS class renames.
+        "wait_selector": 'li[data-test-id^="search_product"]',
+        "card_selector": 'li[data-test-id^="search_product"]',
+        # h3 is the title tag. Do NOT use the hashed class (h1jf9kdi) - it changes on deploys.
+        "title_selector": "h3",
+        # Confirmed: actual shelf price lives in div.pvyf6gm > span[data-test-is-discounted-price]
+        # The first price span in each card is a 799kr game voucher promo - we skip it
+        # by targeting only the one inside div.pvyf6gm (the price shelf div).
+        "price_selector": '[class*="pvyf6gm"] span[data-test-is-discounted-price]',
         "load_event": "domcontentloaded",
     },
     "elgiganten": {
-        # Removed the gad_campaignid tracking param — it causes extra redirects
         "url": (
             "https://www.elgiganten.se/gaming/datorkomponenter/grafikkort-gpu"
             "?f=30877%3AGeForce%2520RTX%25205090"
         ),
-        # Elgiganten is a React SPA; product tiles are injected by JS after load.
         "wait_selector": "[class*='product-tile'], [class*='ProductTile'], [data-testid*='product']",
         "card_selector": "[class*='product-tile'], [class*='ProductTile'], [data-testid*='product']",
         "title_selector": "h3, h2, [class*='title'], [class*='name']",
+        # Target only elements that contain digits (real prices), not promo text like "SPEL PA KOPET"
+        # Use a broad selector here; the digit-filter in the scrape loop handles the rest.
         "price_selector": "[class*='price'], [class*='Price']",
         "load_event": "domcontentloaded",
     },
 }
 
-WAIT_FOR_CONTENT_TIMEOUT = 20_000  # ms to wait for JS-rendered product list
+WAIT_FOR_CONTENT_TIMEOUT = 20_000  # ms
 
 
 def handle_cookie_popup(page):
     selectors = [
         "button:has-text('OK')",
         "button:has-text('Acceptera')",
-        "button:has-text('Godkänn alla')",
-        "button:has-text('Godkänn')",
+        "button:has-text('Godkann alla')",
+        "button:has-text('Godkann')",
         "button:has-text('Accept all')",
         "button:has-text('Accept')",
-        "button:has-text('Jag förstår')",
+        "button:has-text('Jag forstar')",
         "#CybotCookiebotDialogBodyLevelButtonLevelOptinAllowAll",
         "[id*='accept'][class*='cookie']",
     ]
@@ -66,7 +70,6 @@ def handle_cookie_popup(page):
                 return
         except Exception:
             pass
-    # Fallback: remove overlays via JS
     page.evaluate("""() => {
         ['[role="dialog"]', '.modal', '[class*="cookie"]',
          '[class*="overlay"]', '[class*="consent"]', '#onetrust-banner-sdk']
@@ -77,12 +80,12 @@ def handle_cookie_popup(page):
 
 def send_discord_alert(webhook_url, store, title, price_text, product_url):
     if not webhook_url:
-        print("  [Discord] DISCORD_WEBHOOK env var not set – skipping alert.")
+        print("  [Discord] DISCORD_WEBHOOK env var not set - skipping alert.")
         return
     price_line = f"\n**{price_text}**" if price_text else ""
     payload = {
         "embeds": [{
-            "title": "🚀 RTX 5090 Found!",
+            "title": "RTX 5090 Found!",
             "description": f"**{title}**{price_line}\n\nStore: {store}",
             "url": product_url,
             "color": 0xE74C3C,
@@ -97,13 +100,6 @@ def send_discord_alert(webhook_url, store, title, price_text, product_url):
 
 
 def build_browser_and_context(playwright):
-    """
-    Launch Chromium and return (browser, context).
-    Reuses saved cookie state if available.
-    IMPORTANT: both browser and context must stay alive for the full run
-    and be closed explicitly — this fixes the bug in the original script
-    where the browser went out of scope and closed prematurely.
-    """
     browser = playwright.chromium.launch(
         headless=True,
         args=[
@@ -112,7 +108,6 @@ def build_browser_and_context(playwright):
             "--disable-blink-features=AutomationControlled",
         ],
     )
-
     context_kwargs = {
         "viewport": {"width": 1920, "height": 1080},
         "user_agent": (
@@ -123,16 +118,34 @@ def build_browser_and_context(playwright):
         "locale": "sv-SE",
         "timezone_id": "Europe/Stockholm",
     }
-
     if Path(STATE_FILE).exists():
         context_kwargs["storage_state"] = STATE_FILE
         print("  [Browser] Restored saved cookie state.")
-
     context = browser.new_context(**context_kwargs)
     context.add_init_script(
         "Object.defineProperty(navigator, 'webdriver', { get: () => undefined });"
     )
     return browser, context
+
+
+def extract_price(card, price_selector):
+    """
+    Return the first element matching price_selector whose text contains a digit.
+    This filters out promo labels like 'SPEL PA KOPET' or '799 kr' game vouchers
+    that share the same selector as the real shelf price.
+    For inet, the selector already targets only the shelf price div so this is
+    just a safety net.
+    """
+    try:
+        price_els = card.query_selector_all(price_selector)
+        for el in price_els:
+            text = el.inner_text().strip()
+            if any(c.isdigit() for c in text):
+                # Normalise non-breaking spaces
+                return text.replace("\u00a0", " ")
+    except Exception:
+        pass
+    return None
 
 
 def run_tracker():
@@ -153,13 +166,9 @@ def run_tracker():
         for store, info in STORES.items():
             print(f"\n--- Checking {store} ---")
             try:
-                # 1. Navigate — domcontentloaded won't hang on analytics pings
                 page.goto(info["url"], wait_until=info["load_event"], timeout=60_000)
-
-                # 2. Dismiss cookie consent
                 handle_cookie_popup(page)
 
-                # 3. Wait for JS to render product cards
                 try:
                     page.wait_for_selector(
                         info["wait_selector"],
@@ -168,21 +177,19 @@ def run_tracker():
                     )
                     print(f"  Product list visible for {store}.")
                 except PlaywrightTimeoutError:
-                    print(f"  Timed out waiting for products on {store} – saving debug artefacts.")
+                    print(f"  Timed out waiting for products on {store} - saving debug artefacts.")
                     page.screenshot(path=f"/app/data/debug/{store}_timeout.png")
 
-                # 4. Save HTML dump for selector debugging
                 with open(f"/app/data/debug/{store}_dump.html", "w", encoding="utf-8") as f:
                     f.write(page.content())
                 print(f"  Debug HTML saved.")
 
-                # 5. Scrape cards
                 cards = page.query_selector_all(info["card_selector"])
                 print(f"  Found {len(cards)} product cards.")
 
                 if len(cards) == 0:
                     page.screenshot(path=f"/app/data/debug/{store}_empty.png")
-                    print("  Screenshot saved (0 cards – check debug HTML for real class names).")
+                    print("  Screenshot saved (0 cards).")
 
                 for card in cards:
                     title_el = card.query_selector(info["title_selector"])
@@ -192,15 +199,10 @@ def run_tracker():
 
                     price_text = None
                     if info.get("price_selector"):
-                        try:
-                            price_el = card.query_selector(info["price_selector"])
-                            price_text = price_el.inner_text().strip() if price_el else None
-                        except Exception:
-                            pass
+                        price_text = extract_price(card, info["price_selector"])
 
-                    print(f"    - {title[:70]} | {price_text or '—'}")
+                    print(f"    - {title[:70]} | {price_text or 'no price'}")
 
-                    # Alert whenever title contains "5090", price optional
                     if "5090" in title:
                         key = f"{store}|{title}|{price_text or 'no-price'}"
                         if key not in history:
@@ -210,7 +212,7 @@ def run_tracker():
                             )
                             history[key] = time.time()
                         else:
-                            print(f"    (already notified – skipping)")
+                            print(f"    (already notified - skipping)")
 
             except PlaywrightTimeoutError as e:
                 print(f"  [Timeout] {store}: {str(e)[:200]}")
@@ -221,7 +223,6 @@ def run_tracker():
             except Exception as e:
                 print(f"  [Error] {store}: {str(e)[:200]}")
 
-        # Persist cookies so next run skips consent popups
         try:
             context.storage_state(path=STATE_FILE)
             print("\n  [Browser] Cookie state saved.")
