@@ -221,16 +221,31 @@ def parse_price_value(price_str):
 
 
 def detect_changes(current_listings, prev_store_data):
+    """
+    Detect real changes: new products never seen before, price changes.
+    Ignore rotation churn: products disappearing/reappearing due to pagination
+    or display window changes.
+    
+    DB structure per product:
+    {
+        "price": str,
+        "first_seen": timestamp,
+        "last_seen": timestamp,     # updated every time the product appears
+        "visible": bool              # True = was in the most recent scrape
+    }
+    """
     changes = []
     current_titles = {item["title"] for item in current_listings}
-    prev_titles    = set(prev_store_data.keys())
 
     for item in current_listings:
         title = item["title"]
         price = item["price"]
+        
         if title not in prev_store_data:
+            # Truly new — never seen before in the DB
             changes.append({"type": "new", "title": title, "price": price})
         else:
+            # Known product — check for price changes only
             old_price_str = prev_store_data[title].get("price")
             old_val = parse_price_value(old_price_str)
             new_val = parse_price_value(price)
@@ -249,9 +264,20 @@ def detect_changes(current_listings, prev_store_data):
                         "old_price": old_price_str,
                         "new_price": price,
                     })
+            # If product reappeared after being hidden, don't alert
+            # (rotation churn suppression happens here silently)
 
-    for title in prev_titles - current_titles:
-        changes.append({"type": "gone", "title": title})
+    # Only alert on "gone" if a product was visible last run and has been
+    # completely absent for multiple runs (grace period to handle rotation).
+    # For now, we simply don't report "gone" at all to avoid rotation spam.
+    # Uncomment below if you want "gone" alerts after a product is missing for 3+ runs.
+    #
+    # for title in prev_store_data:
+    #     if title not in current_titles:
+    #         was_visible = prev_store_data[title].get("visible", True)
+    #         runs_missing = prev_store_data[title].get("runs_missing", 0) + 1
+    #         if was_visible and runs_missing >= 3:
+    #             changes.append({"type": "gone", "title": title})
 
     return changes
 
@@ -283,9 +309,13 @@ def build_table_embed(store_info, current_listings, prev_store_data, changes, is
 
     # Find cheapest listing and whether it changed since last run
     cheapest_title     = find_cheapest_title(current_listings)
-    prev_cheapest      = find_cheapest_title([
-        {"title": t, "price": v.get("price")} for t, v in prev_store_data.items()
-    ])
+    # Only compare against products that were visible in the last scrape
+    prev_visible = [
+        {"title": t, "price": v.get("price")}
+        for t, v in prev_store_data.items()
+        if v.get("visible", True)  # default True for legacy DB entries
+    ]
+    prev_cheapest = find_cheapest_title(prev_visible)
     cheapest_changed   = (
         cheapest_title is not None
         and prev_cheapest is not None
@@ -319,13 +349,6 @@ def build_table_embed(store_info, current_listings, prev_store_data, changes, is
                 price_col = price_col + " \U0001f3c6"  # keep change marker + flag price
 
         rows.append(f"{marker}{i:<2} {title_col:<38} {price_col:>12}")
-
-    gone_titles = [c["title"] for c in changes if c["type"] == "gone"]
-    if gone_titles:
-        rows.append(divider)
-        rows.append("Gone this run:")
-        for t in gone_titles:
-            rows.append(f"\u274c  {truncate(t)}")
 
     table_text = "```\n" + "\n".join(rows) + "\n```"
 
@@ -587,14 +610,32 @@ def run_tracker():
                 if any(c["type"] in ("new", "price_drop") for c in changes):
                     has_urgent_change = True
 
+            # Update DB: mark all products from this scrape as visible and current
             new_store_data = {}
+            current_titles = {item["title"] for item in current_listings}
+            
             for item in current_listings:
-                new_store_data[item["title"]] = {
+                title = item["title"]
+                prev_entry = prev_store_data.get(title, {})
+                new_store_data[title] = {
                     "price": item["price"],
-                    "first_seen": prev_store_data.get(item["title"], {}).get(
-                        "first_seen", time.time()
-                    ),
+                    "first_seen": prev_entry.get("first_seen", time.time()),
+                    "last_seen": time.time(),
+                    "visible": True,
                 }
+            
+            # Keep historical products in DB even if not currently visible
+            # (prevents rotation churn from causing "new" alerts when they reappear)
+            for title, entry in prev_store_data.items():
+                if title not in current_titles:
+                    # Product not in current scrape — mark invisible but keep in DB
+                    new_store_data[title] = {
+                        **entry,
+                        "visible": False,
+                        # Track how many runs it's been missing (for future "gone" logic)
+                        "runs_missing": entry.get("runs_missing", 0) + 1,
+                    }
+            
             db[store] = new_store_data
 
         try:
