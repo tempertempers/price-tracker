@@ -264,10 +264,34 @@ def truncate(text, length=38):
     return text if len(text) <= length else text[:length - 1] + "\u2026"
 
 
+def find_cheapest_title(listings):
+    """Return the title of the listing with the lowest numeric price, or None."""
+    best_title = None
+    best_val   = None
+    for item in listings:
+        val = parse_price_value(item["price"])
+        if val is not None and (best_val is None or val < best_val):
+            best_val   = val
+            best_title = item["title"]
+    return best_title
+
+
 def build_table_embed(store_info, current_listings, prev_store_data, changes, is_first_run):
     display_name = store_info["display_name"]
     store_url    = store_info["url"]
     has_changes  = bool(changes)
+
+    # Find cheapest listing and whether it changed since last run
+    cheapest_title     = find_cheapest_title(current_listings)
+    prev_cheapest      = find_cheapest_title([
+        {"title": t, "price": v.get("price")} for t, v in prev_store_data.items()
+    ])
+    cheapest_changed   = (
+        cheapest_title is not None
+        and prev_cheapest is not None
+        and cheapest_title != prev_cheapest
+        and not is_first_run
+    )
 
     header  = f"{'#':<3} {'Product':<38} {'Price':>12}"
     divider = "\u2500" * len(header)
@@ -276,13 +300,24 @@ def build_table_embed(store_info, current_listings, prev_store_data, changes, is
     for i, item in enumerate(current_listings, 1):
         title_col = truncate(item["title"])
         price_col = item["price"] if item["price"] else "\u2014"
+        is_cheapest = (item["title"] == cheapest_title)
+
+        # Change marker takes the row prefix slot
         marker = "  "
         for c in changes:
             if c["title"] == item["title"]:
-                if c["type"] == "new":        marker = "\U0001f195"
+                if c["type"] == "new":          marker = "\U0001f195"
                 elif c["type"] == "price_drop": marker = "\U0001f4c9"
                 elif c["type"] == "price_up":   marker = "\U0001f4c8"
                 break
+
+        # Trophy goes on the row marker if no change marker, else appended to price
+        if is_cheapest:
+            if marker == "  ":
+                marker = "\U0001f3c6"               # 🏆 in the marker slot
+            else:
+                price_col = price_col + " \U0001f3c6"  # keep change marker + flag price
+
         rows.append(f"{marker}{i:<2} {title_col:<38} {price_col:>12}")
 
     gone_titles = [c["title"] for c in changes if c["type"] == "gone"]
@@ -295,7 +330,7 @@ def build_table_embed(store_info, current_listings, prev_store_data, changes, is
     table_text = "```\n" + "\n".join(rows) + "\n```"
 
     fields = []
-    if has_changes and not is_first_run:
+    if (has_changes or cheapest_changed) and not is_first_run:
         change_lines = []
         for c in changes:
             if c["type"] == "new":
@@ -313,6 +348,15 @@ def build_table_embed(store_info, current_listings, prev_store_data, changes, is
                 )
             elif c["type"] == "gone":
                 change_lines.append(f"\u274c **Gone:** {c['title']}")
+        # Note if cheapest deal changed hands this run
+        if cheapest_changed:
+            cheapest_price = next(
+                (i["price"] for i in current_listings if i["title"] == cheapest_title), None
+            )
+            change_lines.append(
+                f"\U0001f3c6 **New cheapest:** {truncate(cheapest_title, 45)}"
+                + (f"\n    **{cheapest_price}**" if cheapest_price else "")
+            )
         if change_lines:
             fields.append({
                 "name": "\u26a1 Changes detected",
@@ -320,23 +364,36 @@ def build_table_embed(store_info, current_listings, prev_store_data, changes, is
                 "inline": False,
             })
 
+    # Cheapest-only change (no price/stock changes) is informational — orange
     if not current_listings:
         color = COLOR_GREY
     elif has_changes and not is_first_run and any(c["type"] in ("new", "price_drop") for c in changes):
         color = COLOR_RED
-    elif has_changes and not is_first_run:
+    elif (has_changes or cheapest_changed) and not is_first_run:
         color = COLOR_ORANGE
     else:
         color = COLOR_GREEN
 
+    # Build footer status line
     if is_first_run:
-        status = f"\U0001f4cb Initial snapshot \u2014 {len(current_listings)} listing(s)"
+        cheapest_price = next(
+            (i["price"] for i in current_listings if i["title"] == cheapest_title), None
+        ) if cheapest_title else None
+        cheapest_note = f" | \U0001f3c6 {truncate(cheapest_title, 28)}: {cheapest_price}" if cheapest_title and cheapest_price else ""
+        status = f"\U0001f4cb Initial snapshot \u2014 {len(current_listings)} listing(s){cheapest_note}"
     elif has_changes:
-        status = f"\u26a0\ufe0f  {len(changes)} change(s) detected"
+        n = len(changes) + (1 if cheapest_changed else 0)
+        status = f"\u26a0\ufe0f  {n} change(s) detected"
+    elif cheapest_changed:
+        status = f"\U0001f3c6 Cheapest deal changed"
     elif not current_listings:
         status = "\u26a0\ufe0f  No listings found"
     else:
-        status = f"\u2705  {len(current_listings)} listing(s) \u2014 no changes"
+        cheapest_price = next(
+            (i["price"] for i in current_listings if i["title"] == cheapest_title), None
+        ) if cheapest_title else None
+        cheapest_note = f" | \U0001f3c6 {truncate(cheapest_title, 28)}: {cheapest_price}" if cheapest_title and cheapest_price else ""
+        status = f"\u2705  {len(current_listings)} listing(s) \u2014 no changes{cheapest_note}"
 
     return {
         "title": f"\U0001f5a5\ufe0f  RTX 5090 \u2014 {display_name}",
