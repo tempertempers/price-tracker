@@ -2,25 +2,27 @@ import os
 import time
 import json
 import requests
+from pathlib import Path
 from playwright.sync_api import sync_playwright
 
 # --- CONFIGURATION ---
 DISCORD_WEBHOOK_URL = os.getenv("DISCORD_WEBHOOK")
 CHECK_INTERVAL = 300
 DB_FILE = "/app/data/tracker_db.json"
+STATE_FILE = "/app/data/storage_state.json"
 
 STORES = {
     "inet": {
         "url": "https://www.inet.se/hitta?q=5090&filter=%7B%22query%22%3A%22RTX%205090%22%2C%22templateId%22%3A17%7D&sortColumn=search&sortDirection=desc",
         "card_selector": ".product, .product-list__item",
         "title_selector": ".product__title, .product-name",
-        "price_selector": None  # TBD
+        "price_selector": None
     },
     "elgiganten": {
         "url": "https://www.elgiganten.se/gaming/datorkomponenter/grafikkort-gpu?gad_campaignid=1506298985&f=30877%3AGeForce%2520RTX%25205090",
         "card_selector": "div.product-tile, article.product-tile",
         "title_selector": "h3, .product-name",
-        "price_selector": "#ActivePrice\\.Amount-max"
+        "price_selector": "span.font-headline"
     },
     "netonnet": {
         "url": "https://www.netonnet.se/search?query=RTX%205090%20grafikkort",
@@ -30,16 +32,52 @@ STORES = {
     }
 }
 
-def accept_cookies_if_present(page):
-    try:
-        btn = page.wait_for_selector(
-            "button:has-text('Acceptera'), button:has-text('Godkänn'), button:has-text('Accept')",
-            timeout=5000
-        )
-        btn.click()
-        page.wait_for_timeout(1000)
-    except:
-        pass
+def handle_cookie_popup(page):
+    # Försök klicka på vanliga accept-knappar
+    selectors = [
+        "button:has-text('OK')",
+        "button:has-text('Acceptera')",
+        "button:has-text('Godkänn')",
+        "button:has-text('Accept')",
+        "button:has-text('Jag förstår')"
+    ]
+    for sel in selectors:
+        try:
+            btn = page.wait_for_selector(sel, timeout=3000)
+            btn.click()
+            page.wait_for_timeout(1500)
+            return
+        except:
+            pass
+
+    # Om klick ej fungerade → ta bort popup/overlay
+    page.evaluate("""
+        () => {
+            document.querySelectorAll('[role="dialog"], .modal, .cookie-banner, .overlay').forEach(el => el.remove());
+        }
+    """)
+    page.wait_for_timeout(1000)
+
+def create_or_restore_context(playwright):
+    # Om state finns, återanvänd cookie/state
+    if Path(STATE_FILE).exists():
+        return playwright.chromium.launch().new_context(storage_state=STATE_FILE)
+
+    # Annars skapa ny, godkänn cookie, spara state
+    browser = playwright.chromium.launch(headless=True)
+    context = browser.new_context(
+        viewport={"width": 1920, "height": 1080},
+        user_agent=("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
+                     " Chrome/121.0.0.0 Safari/537.36")
+    )
+    page = context.new_page()
+    # Navigera till någon sida för att trigga cookie popup
+    page.goto("https://www.elgiganten.se", wait_until="networkidle")
+    handle_cookie_popup(page)
+    # Spara state efter accept
+    context.storage_state(path=STATE_FILE)
+    page.close()
+    return browser.new_context(storage_state=STATE_FILE)
 
 def run_tracker():
     os.makedirs("/app/data/debug", exist_ok=True)
@@ -52,11 +90,8 @@ def run_tracker():
             history = {}
 
     with sync_playwright() as p:
-        browser = p.chromium.launch(headless=True)
-        context = browser.new_context(
-            viewport={"width": 1920, "height": 1080},
-            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/121.0.0.0 Safari/537.36"
-        )
+        # skapa/återställ cookie-context
+        context = create_or_restore_context(p)
         page = context.new_page()
 
         for store, info in STORES.items():
@@ -64,20 +99,21 @@ def run_tracker():
             try:
                 page.goto(info["url"], wait_until="networkidle", timeout=60000)
 
-                accept_cookies_if_present(page)
+                handle_cookie_popup(page)
+                page.wait_for_timeout(2000)
 
-                # Save HTML for debugging selector
+                # spara HTML-dump
                 html = page.content()
                 with open(f"/app/data/debug/{store}_dump.html", "w", encoding="utf-8") as f:
                     f.write(html)
-                print(f"  Saved HTML dump for {store}.")
+                print(f"  Saved debug HTML for {store}.")
 
                 cards = page.query_selector_all(info["card_selector"])
-                print(f"  Found {len(cards)} cards.")
+                print(f"  Found {len(cards)} items.")
 
                 if len(cards) == 0:
                     page.screenshot(path=f"/app/data/debug/{store}_empty.png")
-                    print(f"  No cards found, saved screenshot.")
+                    print("  No products found, screenshot saved.")
 
                 for card in cards:
                     title_el = card.query_selector(info["title_selector"])
@@ -98,7 +134,7 @@ def run_tracker():
                         if key not in history:
                             requests.post(DISCORD_WEBHOOK_URL, json={
                                 "embeds": [{
-                                    "title": f"🚀 5090 prisuppdatering!",
+                                    "title": "🚀 RTX 5090 Found!",
                                     "description": f"{title}\n{price_text}",
                                     "url": info["url"],
                                     "color": 15158332
@@ -109,10 +145,13 @@ def run_tracker():
             except Exception as e:
                 print(f"  [Error] {store}: {str(e)[:150]}")
 
-        browser.close()
+        context.close()
 
     with open(DB_FILE, "w") as f:
         json.dump(history, f)
 
 if __name__ == "__main__":
-    run_tracker()
+    while True:
+        run_tracker()
+        print(f"Done. Sleeping {CHECK_INTERVAL}s.\n")
+        time.sleep(CHECK_INTERVAL)
